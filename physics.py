@@ -28,6 +28,162 @@ ELEMENTARY_CHARGE = e  # 1.602176634e-19 C
 PROTON_MASS = m_p      # 1.67262192369e-27 kg
 ELECTRON_MASS = m_e    # 9.1093837015e-31 kg
 MU_0 = 4 * np.pi * 1e-7  # Permeability of free space [T·m/A]
+K_B = 1.380649e-23
+KEV_TO_J = 1.0e3 * ELEMENTARY_CHARGE
+
+
+@dataclass(frozen=True)
+class PulseParameters:
+    """Inputs to the zero-dimensional pulsed-FRC energy balance model.
+
+    This intentionally is a reactor *concept* model, not a design-certified
+    transport calculation.  Temperatures are ion/electron-equilibrated keV,
+    densities are total ion densities, and the initial plasma is an ellipsoid.
+    """
+
+    b_ext: float = 8.0
+    density: float = 3.0e20
+    temperature_kev: float = 45.0
+    compression_ratio: float = 4.0
+    duration_ms: float = 8.0
+    fuel: str = "D-He3"
+    initial_radius_m: float = 0.32
+    initial_length_m: float = 1.2
+    gamma: float = 5.0 / 3.0
+    coil_turns: int = 40
+    coil_resistance_ohm: float = 0.025
+    coupling_efficiency: float = 0.82
+
+    def __post_init__(self) -> None:
+        if self.b_ext <= 0 or self.density <= 0 or self.temperature_kev <= 0:
+            raise ValueError("Field, density, and temperature must be positive")
+        if self.compression_ratio < 1 or self.duration_ms <= 0:
+            raise ValueError("Compression ratio must be >= 1 and duration positive")
+        if self.fuel not in {"D-He3", "D-T"}:
+            raise ValueError("fuel must be 'D-He3' or 'D-T'")
+
+
+def fusion_reactivity(temperature_kev: np.ndarray | float, fuel: str = "D-He3") -> np.ndarray:
+    """Return Maxwellian-averaged fusion reactivity in m³/s.
+
+    The smooth fits retain the Gamow rise and high-temperature roll-off of
+    published D--He3/D--T reactivity curves in the 1--300 keV range.  They are
+    deliberately bounded outside that range to keep an interactive ODE stable.
+    """
+    t = np.clip(np.asarray(temperature_kev, dtype=float), 0.2, 400.0)
+    if fuel == "D-He3":
+        # Log-normal fit to the D--He3 Maxwellian reactivity peak (~70 keV).
+        # It avoids the low-temperature overprediction of a simple T² fit.
+        rate = 2.4e-22 * np.exp(-((np.log(t) - np.log(70.0)) ** 2) / 1.5)
+    elif fuel == "D-T":
+        rate = 8.7e-22 * (t / 65.0) ** 1.55 * np.exp(1.55 * (1.0 - t / 65.0))
+    else:
+        raise ValueError("Unsupported fuel")
+    return np.maximum(rate, 0.0)
+
+
+def calculate_frc_physics(
+    n_ion_m3: np.ndarray | float,
+    temperature_kev: np.ndarray | float,
+    b_ext_t: np.ndarray | float,
+    compression_ratio: float = 1.0,
+    fuel: str = "D-He3",
+) -> Dict[str, np.ndarray]:
+    """Calculate internally consistent local power-density and beta diagnostics.
+
+    ``temperature_kev * KEV_TO_J`` is already the thermal energy per particle;
+    therefore no extra Boltzmann constant belongs in the pressure expression.
+    For an equimolar D--He3 mixture, quasi-neutrality gives ``n_e=1.5 n_i``
+    and the total particle density is ``2.5 n_i``.
+    """
+    n_i = np.asarray(n_ion_m3, dtype=float)
+    temp = np.clip(np.asarray(temperature_kev, dtype=float), 0.15, None)
+    b_field = np.asarray(b_ext_t, dtype=float)
+    if np.any(n_i <= 0) or np.any(b_field <= 0):
+        raise ValueError("Ion density and magnetic field must be positive")
+
+    if fuel == "D-He3":
+        n_e, n_total, z_eff, fusion_mev = 1.5 * n_i, 2.5 * n_i, 1.667, 18.4
+        # This coefficient expects T in keV and is not converted again.
+        p_brems = 1.69e-35 * n_e * n_i * z_eff**2 * np.sqrt(temp)
+    elif fuel == "D-T":
+        n_e, n_total, z_eff, fusion_mev = n_i, 2.0 * n_i, 1.0, 17.6
+        p_brems = 5.34e-37 * n_e * n_i * np.sqrt(temp)
+    else:
+        raise ValueError("Unsupported fuel")
+
+    p_plasma = n_total * temp * KEV_TO_J
+    p_magnetic = b_field**2 / (2.0 * MU_0)
+    p_fusion = 0.25 * n_i**2 * fusion_reactivity(temp, fuel) * fusion_mev * 1e6 * ELEMENTARY_CHARGE
+    p_sync = 1.0e-38 * n_e * b_field**2 * temp
+    p_net = p_fusion - p_brems - p_sync
+    return {"plasma_pressure_pa": p_plasma, "magnetic_pressure_pa": p_magnetic,
+            "beta": p_plasma / p_magnetic, "fusion_w_m3": p_fusion,
+            "brems_w_m3": p_brems, "sync_w_m3": p_sync, "net_w_m3": p_net,
+            "particle_density_m3": n_total}
+
+
+def _pulse_volume(time_s: np.ndarray, params: PulseParameters) -> np.ndarray:
+    """Prescribed compression then expansion geometry used by the coupled ODE."""
+    t_end = params.duration_ms * 1e-3
+    burn_end = 0.62 * t_end
+    initial = 4.0 / 3.0 * np.pi * params.initial_radius_m**2 * (params.initial_length_m / 2.0)
+    fraction = np.where(time_s <= burn_end, time_s / burn_end, 1.0 - (time_s - burn_end) / (t_end - burn_end))
+    # Compression ratio is a volume ratio; return smoothly to the initial volume.
+    return initial / (1.0 + (params.compression_ratio - 1.0) * np.clip(fraction, 0.0, 1.0))
+
+
+def simulate_frc_pulse(params: PulseParameters, samples: int = 360) -> Dict[str, np.ndarray | str | bool]:
+    """Solve a tightly coupled 0D FRC temperature/energy balance with ``solve_ivp``.
+
+    The ODE contains adiabatic work ``-(gamma-1) T d(ln V)/dt`` and fusion,
+    bremsstrahlung, and synchrotron terms. Density follows particle conservation
+    exactly (``n V = constant``), so each loss and fusion term feeds back into
+    the thermal state at every integrator step.
+    """
+    t_end = params.duration_ms * 1e-3
+    time = np.linspace(0.0, t_end, samples)
+    v0 = float(_pulse_volume(np.array([0.0]), params)[0])
+    n_particles = params.density * v0
+
+    def rhs(t: float, y: np.ndarray) -> np.ndarray:
+        temp = max(float(y[0]), 0.15)
+        dt = max(1e-8, t_end * 1e-5)
+        volume = float(_pulse_volume(np.array([t]), params)[0])
+        dlnv_dt = (np.log(float(_pulse_volume(np.array([min(t + dt, t_end)]), params)[0])) -
+                    np.log(float(_pulse_volume(np.array([max(t - dt, 0.0)]), params)[0]))) / (min(t + dt, t_end) - max(t - dt, 0.0) + 1e-15)
+        density = n_particles / volume
+        b = params.b_ext * np.sqrt(v0 / volume)
+        local = calculate_frc_physics(density, temp, b, params.compression_ratio, params.fuel)
+        # U = (3/2) n_total T.  n_total includes ions and electrons.
+        heat_capacity = 1.5 * float(local["particle_density_m3"]) * KEV_TO_J
+        return [-(params.gamma - 1.0) * temp * dlnv_dt + float(local["net_w_m3"]) / heat_capacity]
+
+    solution = solve_ivp(rhs, (0.0, t_end), [params.temperature_kev], t_eval=time,
+                         method="RK45", rtol=2e-6, atol=1e-7, max_step=t_end / 240.0)
+    if not solution.success:
+        raise RuntimeError(f"Pulse integration failed: {solution.message}")
+
+    temp = np.maximum(solution.y[0], 0.15)
+    volume = _pulse_volume(time, params)
+    density = n_particles / volume
+    field = params.b_ext * np.sqrt(v0 / volume)
+    local = calculate_frc_physics(density, temp, field, params.compression_ratio, params.fuel)
+    pfus, pbrem = local["fusion_w_m3"], local["brems_w_m3"]
+    psync, pnet, beta = local["sync_w_m3"], local["net_w_m3"], local["beta"]
+    radius = params.initial_radius_m * (volume / v0) ** (1.0 / 3.0)
+    flux = field * np.pi * radius**2
+    emf = -params.coil_turns * np.gradient(flux, time)
+    # A passive resistive load sees I=EMF/R, then coupling reduces delivered power.
+    current = emf / params.coil_resistance_ohm
+    pelec = params.coupling_efficiency * emf * current if params.fuel == "D-He3" else np.zeros_like(emf)
+    unstable = bool(np.any(beta > 1.0))
+    net_positive = bool(np.max(pnet) > 0.0 and np.trapz(pelec, time) > 0.0)
+    status = "UNSTABLE" if unstable else ("IGNITION / NET POSITIVE" if net_positive else "SUB-CRITICAL")
+    return {"time_s": time, "temperature_kev": temp, "density_m3": density, "volume_m3": volume,
+            "field_t": field, "fusion_w_m3": pfus, "brems_w_m3": pbrem, "sync_w_m3": psync,
+            "net_w_m3": pnet, "beta": beta, "emf_v": emf, "electric_w": pelec,
+            "unstable": unstable, "status": status, "fuel": params.fuel}
 
 
 @dataclass
