@@ -25,6 +25,20 @@ python physics.py
 MPLBACKEND=Agg python dashboard.py
 ```
 
+## Run the pulsed FRC Digital Twin
+
+The Dash control room solves a coupled, time-dependent 0D pulse at every
+control update. It includes compression work, D--He3/D--T fusion reactivity,
+bremsstrahlung and synchrotron losses, beta monitoring, and inductive direct
+energy conversion for D--He3 operation.
+
+```bash
+python app.py
+```
+
+Open <http://127.0.0.1:8050>. This is an educational, idealized model and is
+not a reactor design or a safety analysis.
+
 Run the automated regression tests with:
 
 ```bash
