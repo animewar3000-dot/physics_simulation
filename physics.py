@@ -57,6 +57,12 @@ class ParticleState:
             raise ValueError("Position must be 3D vector")
         if self.velocity.shape[-1] != 3:
             raise ValueError("Velocity must be 3D vector")
+        if self.position.shape != self.velocity.shape:
+            raise ValueError("Position and velocity must have matching shapes")
+        if self.position.ndim not in (1, 2):
+            raise ValueError("Position and velocity must be shape (3,) or (N, 3)")
+        if self.mass <= 0:
+            raise ValueError("Mass must be positive")
     
     @property
     def kinetic_energy(self) -> float | np.ndarray:
@@ -69,7 +75,6 @@ class ParticleState:
         """Calculate momentum: p = mv"""
         return self.mass * self.velocity
     
-    @property
     def gyroradius(self, B_magnitude: float) -> float | np.ndarray:
         """
         Calculate Larmor gyroradius: r_L = mv_perp / (|q|B)
@@ -83,7 +88,6 @@ class ParticleState:
         v_perp = np.linalg.norm(self.velocity, axis=-1)  # Approximation
         return self.mass * v_perp / (np.abs(self.charge) * B_magnitude)
     
-    @property
     def gyrofrequency(self, B_magnitude: float) -> float | np.ndarray:
         """
         Calculate cyclotron frequency: ω_c = |q|B / m
