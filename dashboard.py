@@ -16,19 +16,14 @@ Uses matplotlib for 2D plots and optional plotly for interactive visualization.
 import numpy as np
 from typing import Optional, Dict, List, Tuple, Any
 from dataclasses import dataclass, field
+import importlib.util
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
 from matplotlib.animation import FuncAnimation
 import warnings
 
-# Try to import plotly for interactive plots (optional)
-try:
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-    PLOTLY_AVAILABLE = True
-except ImportError:
-    PLOTLY_AVAILABLE = False
-    warnings.warn("Plotly not available. Using matplotlib only.")
+# Plotly remains optional; importing it is deferred until an interactive
+# dashboard is requested so matplotlib-only use does not require Plotly.
+PLOTLY_AVAILABLE = importlib.util.find_spec("plotly") is not None
 
 
 @dataclass
@@ -98,12 +93,20 @@ class TelemetryData:
         B_r, B_theta, B_z = self.B_field
         return np.sqrt(B_r**2 + B_theta**2 + B_z**2)
     
-    def get_field_components_along_axis(self, axis: str = 'z') -> Dict[str, np.ndarray]:
+    def get_field_components_along_axis(
+        self,
+        axis: str = 'z',
+        r_coords: Optional[np.ndarray] = None,
+        z_coords: Optional[np.ndarray] = None,
+    ) -> Dict[str, np.ndarray]:
         """
         Extract field components along a specific axis.
         
         Args:
-            axis: 'z' for axial profile, 'r' for radial profile
+            axis: 'z' for an on-axis axial profile, 'r' for a midplane
+                radial profile
+            r_coords: Optional radial coordinate array for an 'r' profile
+            z_coords: Optional axial coordinate array for a 'z' profile
             
         Returns:
             Dictionary with coordinate array and field components
@@ -111,29 +114,47 @@ class TelemetryData:
         if self.B_field is None:
             return {}
         
-        B_r, B_theta, B_z = self.B_field
-        
-        if axis == 'z':
-            # Take slice at r=0 (on-axis)
-            z_idx = B_z.shape[2] // 2 if len(B_z.shape) > 2 else slice(None)
-            r_idx = 0  # On-axis
-            
+        B_r, _, B_z = (np.asarray(component) for component in self.B_field)
+        if B_r.shape != B_z.shape:
+            raise ValueError("B_r and B_z must have matching shapes")
+        if axis not in {'r', 'z'}:
+            raise ValueError("axis must be 'r' or 'z'")
+
+        def coordinates(values: Optional[np.ndarray], size: int) -> np.ndarray:
+            if values is None:
+                return np.arange(size)
+            values = np.asarray(values)
+            if values.ndim != 1 or values.size != size:
+                raise ValueError("Coordinate array length must match the field profile")
+            return values
+
+        if B_z.ndim == 3:
+            # Field arrays use the simulation grid ordering (theta, r, z).
+            if axis == 'z':
+                profile_r, profile_z = B_r[0, 0, :], B_z[0, 0, :]
+                return {'z': coordinates(z_coords, B_z.shape[2]), 'B_z': profile_z, 'B_r': profile_r}
+
+            midplane = B_z.shape[2] // 2
+            profile_r, profile_z = B_r[0, :, midplane], B_z[0, :, midplane]
+            return {'r': coordinates(r_coords, B_z.shape[1]), 'B_z': profile_z, 'B_r': profile_r}
+
+        if B_z.ndim == 2:
+            if axis == 'z':
+                profile_r, profile_z = B_r[0, :], B_z[0, :]
+                return {'z': coordinates(z_coords, B_z.shape[1]), 'B_z': profile_z, 'B_r': profile_r}
+
+            midplane = B_z.shape[1] // 2
+            profile_r, profile_z = B_r[:, midplane], B_z[:, midplane]
+            return {'r': coordinates(r_coords, B_z.shape[0]), 'B_z': profile_z, 'B_r': profile_r}
+
+        if B_z.ndim == 1:
             return {
-                'z': np.linspace(-1, 1, B_z.shape[2]) if len(B_z.shape) > 2 else np.arange(len(B_z)),
-                'B_z': B_z[r_idx, :, z_idx] if len(B_z.shape) > 2 else B_z,
-                'B_r': B_r[r_idx, :, z_idx] if len(B_r.shape) > 2 else B_r
+                axis: coordinates(z_coords if axis == 'z' else r_coords, B_z.size),
+                'B_z': B_z,
+                'B_r': B_r,
             }
-        elif axis == 'r':
-            # Take slice at z=0 (midplane)
-            z_idx = B_z.shape[2] // 2 if len(B_z.shape) > 2 else slice(None)
-            
-            return {
-                'r': np.linspace(0, 1, B_z.shape[1]) if len(B_z.shape) > 2 else np.arange(len(B_z)),
-                'B_z': B_z[:, z_idx] if len(B_z.shape) > 2 else B_z,
-                'B_r': B_r[:, z_idx] if len(B_r.shape) > 2 else B_r
-            }
-        
-        return {}
+
+        raise ValueError("Field components must be one-, two-, or three-dimensional")
 
 
 class TelemetryDashboard:
@@ -210,6 +231,10 @@ class TelemetryDashboard:
     
     def _setup_plotly_figure(self) -> None:
         """Set up plotly interactive figure."""
+        if not PLOTLY_AVAILABLE:
+            raise RuntimeError("Plotly is required for an interactive dashboard")
+        from plotly.subplots import make_subplots
+
         self.fig = make_subplots(
             rows=2, cols=2,
             subplot_titles=(
@@ -257,13 +282,16 @@ class TelemetryDashboard:
                                      levels=50, cmap='viridis')
                 plt.colorbar(contour, ax=ax, label='|B| [T]')
                 
-                # Overlay field lines
-                try:
-                    ax.contour(R_slice, Z_slice, B_slice, 
-                              levels=[0.1, 0.5, 1.0], colors='white', 
+                # Overlay field contours only when their levels occur in the data.
+                finite_values = B_slice[np.isfinite(B_slice)]
+                contour_levels = [
+                    level for level in (0.1, 0.5, 1.0)
+                    if finite_values.size and finite_values.min() <= level <= finite_values.max()
+                ]
+                if contour_levels:
+                    ax.contour(R_slice, Z_slice, B_slice,
+                              levels=contour_levels, colors='white',
                               linewidths=0.5, linestyles='dashed')
-                except:
-                    pass
         
         ax.set_xlabel('Radius r [m]')
         ax.set_ylabel('Axial position z [m]')
@@ -288,28 +316,38 @@ class TelemetryDashboard:
             r = vessel_coords.get('r_grid', np.linspace(0, 1, 50))
         else:
             r = np.linspace(0, 1, 50)
+        r = np.asarray(r)
+        if r.ndim != 1 or r.size == 0:
+            raise ValueError("r_grid must be a non-empty one-dimensional array")
+
+        def radial_profile(values: np.ndarray) -> np.ndarray:
+            """Extract a theta=0, z=0 radial profile from grid data."""
+            values = np.asarray(values)
+            if values.ndim == 3:
+                return values[0, :, values.shape[2] // 2]
+            if values.ndim == 2:
+                return values[:, values.shape[1] // 2]
+            if values.ndim == 1:
+                return values
+            raise ValueError("Plasma profiles must be one-, two-, or three-dimensional")
+
+        def profile_coordinates(profile_size: int) -> np.ndarray:
+            if r.size == profile_size:
+                return r
+            return np.linspace(r[0], r[-1], profile_size)
         
         # Plot density profile
         if telemetry.plasma_density is not None:
-            # Extract midplane profile
-            if len(telemetry.plasma_density.shape) > 1:
-                mid_idx = telemetry.plasma_density.shape[-1] // 2
-                density_profile = telemetry.plasma_density[:, mid_idx]
-            else:
-                density_profile = telemetry.plasma_density
+            density_profile = radial_profile(telemetry.plasma_density)
             
-            ax.semilogy(r[:len(density_profile)], density_profile, 
+            ax.semilogy(profile_coordinates(len(density_profile)), density_profile,
                        'b-', label='Density n [m⁻³]', linewidth=2)
         
         # Plot temperature profile
         if telemetry.plasma_temperature is not None:
-            if len(telemetry.plasma_temperature.shape) > 1:
-                mid_idx = telemetry.plasma_temperature.shape[-1] // 2
-                temp_profile = telemetry.plasma_temperature[:, mid_idx]
-            else:
-                temp_profile = telemetry.plasma_temperature
+            temp_profile = radial_profile(telemetry.plasma_temperature)
             
-            ax.plot(r[:len(temp_profile)], temp_profile, 
+            ax.plot(profile_coordinates(len(temp_profile)), temp_profile,
                    'r-', label='Temperature T [eV]', linewidth=2)
         
         ax.set_xlabel('Radius r [m]')
@@ -349,8 +387,9 @@ class TelemetryDashboard:
             ax.legend(loc='upper right')
             ax.grid(True, alpha=0.3)
             
-            # Use log scale if powers vary widely
-            if max(p_input + p_recovered) > 10 * min([p for p in p_input + p_recovered if p > 0]):
+            # Log scaling is valid only when every plotted value is positive.
+            all_powers = p_input + p_recovered + p_net
+            if all(value > 0 for value in all_powers) and max(all_powers) > 10 * min(all_powers):
                 ax.set_yscale('log')
         
         # Display current values as text
